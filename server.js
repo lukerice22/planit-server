@@ -55,6 +55,14 @@ const PORT = process.env.PORT || 5000;
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+app.get("/_envcheck", (req, res) => {
+  const mask = (v) => (v ? `${v.slice(0,6)}…${v.slice(-4)}` : null);
+  res.json({
+    GOOGLE_VISION_API_KEY: mask(process.env.GOOGLE_VISION_API_KEY || ""),
+    GOOGLE_SERVER_API_KEY: mask(process.env.GOOGLE_SERVER_API_KEY || ""),
+  });
+});
+
 // ---- Routes
 app.get("/", (req, res) => {
   res.send("PlanIt backend is running!");

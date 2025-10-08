@@ -3,8 +3,12 @@ const express = require("express");
 const router = express.Router();
 
 // Node 18+ has global fetch
-const GOOGLE_KEY = process.env.GOOGLE_SERVER_API_KEY;
-const VISION_URL = `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_KEY}`;
+const KEY = process.env.GOOGLE_VISION_API_KEY || process.env.GOOGLE_SERVER_API_KEY;
+if (!KEY) {
+  console.error("[/api/location] No Google API key found in env");
+}
+const VISION_URL = `https://vision.googleapis.com/v1/images:annotate?key=${KEY}`;
+
 
 /**
  * Body: { imageUrl?: string, imageBase64?: string }
