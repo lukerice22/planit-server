@@ -103,6 +103,22 @@ try {
   console.warn("[WARN] Could not mount /api/autocomplete:", e.message);
 }
 
+try {
+  const locationRoute = require("./routes/location");
+  app.use("/api/location", locationRoute);
+  console.log("[BOOT] Mounted /api/location");
+} catch (e) {
+  console.warn("[WARN] Could not mount /api/location:", e.message);
+}
+
+try {
+  const tripRoute = require("./routes/trip");
+  app.use("/api/trip", tripRoute);
+  console.log("[BOOT] Mounted /api/trip");
+} catch (e) {
+  console.warn("[WARN] Could not mount /api/trip:", e.message);
+}
+
 // --- Vercel compatibility ---
 if (process.env.VERCEL) {
   module.exports = app;
