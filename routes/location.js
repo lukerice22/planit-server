@@ -1,16 +1,11 @@
-// routes/location.js
-const express = require("express");
-const router = express.Router();
+// api/location.js
+export default async function handler(req, res) {
+  res.setHeader("X-Handler", "gemini-serverless");
 
-// ---- Sanity route to confirm you're hitting THIS file
-router.get("/_whoami", (req, res) => {
-  res.setHeader("X-Handler", "gemini");
-  return res.status(200).json({ ok: true, handler: "gemini-router" });
-});
-
-router.post("/", async (req, res) => {
-  res.setHeader("X-Handler", "gemini");
-  console.log("[/api/location] Gemini route live");
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).send("Method Not Allowed");
+  }
 
   try {
     const geminiKey =
@@ -25,14 +20,14 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "imageBase64 or imageUrl is required" });
     }
 
-    // --- Base64 normalization ---
+    // Normalize base64 (support data URLs)
     let imgB64 = imageBase64 || null;
     if (imgB64 && imgB64.startsWith("data:")) {
       const comma = imgB64.indexOf(",");
       imgB64 = comma >= 0 ? imgB64.slice(comma + 1) : imgB64;
     }
 
-    // --- Fetch image URL if needed ---
+    // If only URL provided, fetch and convert to base64
     if (!imgB64 && imageUrl) {
       const r = await fetch(imageUrl);
       if (!r.ok) return res.status(400).json({ error: "failed_to_fetch_image_url" });
@@ -40,7 +35,7 @@ router.post("/", async (req, res) => {
       imgB64 = buf.toString("base64");
     }
 
-    // --- Gemini (1.5-flash) request ---
+    // ---- Gemini call (1.5-flash)
     const model = "gemini-1.5-flash";
     const prompt = `
 You are a location recognition assistant.
@@ -91,7 +86,7 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
       });
     }
 
-    // --- Places fallback to get lat/lng ---
+    // ---- Places fallback to get lat/lng
     const pieces = [g?.placeName, g?.city, g?.state, g?.country].filter(Boolean);
     let textQuery = pieces.join(" ");
     if (!textQuery && regionHint) textQuery = regionHint;
@@ -113,7 +108,6 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
       });
     }
 
-    // --- Final response ---
     if (!out.candidates.length) {
       return res.status(200).json({ placeName: null, lat: null, lng: null, confidence: 0, message: "no_idea" });
     }
@@ -122,9 +116,7 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
     const best = withGeo || out.candidates[0];
     return res.status(200).json(best);
   } catch (e) {
-    console.error("[/api/location] error", e);
+    console.error("[api/location] error", e);
     return res.status(500).json({ error: "server_error" });
   }
-});
-
-module.exports = router;
+}

@@ -119,6 +119,15 @@ try {
 } catch (e) {
   console.warn("[WARN] Could not mount /api/trip:", e.message);
 }
+// server.js - temporary sanity endpoint (remove after debugging)
+app.get("/api/_whoami", (req, res) => {
+  res.setHeader("X-App", "planit-backend-express");
+  res.status(200).json({
+    ok: true,
+    from: "server.js",
+    mounted: ["/api/autocomplete", "/api/location", "/api/trip"]
+  });
+});
 
 // --- Vercel compatibility ---
 if (process.env.VERCEL) {
