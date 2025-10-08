@@ -1,82 +1,149 @@
-// inside POST /api/location
-const key = process.env.GOOGLE_VISION_API_KEY || process.env.GOOGLE_SERVER_API_KEY;
-const placesKey = process.env.GOOGLE_PLACES_API_KEY || key;
+// POST /api/location  (Gemini + Places)
+import fetch from "node-fetch";
 
-const { imageBase64, imageUrl, regionHint } = req.body;
-if (!imageBase64 && !imageUrl) {
-  return res.status(400).json({ error: "imageBase64 or imageUrl is required" });
-}
+export default async function locationHandler(req, res) {
+  try {
+    const geminiKey =
+      process.env.GOOGLE_GEMINI_API_KEY ||
+      process.env.GOOGLE_SERVER_API_KEY;
+    const placesKey =
+      process.env.GOOGLE_PLACES_API_KEY ||
+      process.env.GOOGLE_SERVER_API_KEY ||
+      geminiKey;
 
-// 1) Vision: request LANDMARK + WEB_DETECTION
-const visionReq = {
-  requests: [{
-    image: imageBase64 ? { content: imageBase64 } : { source: { imageUri: imageUrl } },
-    features: [
-      { type: "LANDMARK_DETECTION", maxResults: 10 },
-      { type: "WEB_DETECTION", maxResults: 10 },
-    ],
-    imageContext: {
-      // helps disambiguate labels (e.g., English landmark names)
-      languageHints: ["en"],
-      // ask Vision to try to include geo if it can infer it from the web
-      webDetectionParams: { includeGeoResults: true }, // safe to include; ignored if not supported
+    const { imageBase64, imageUrl, regionHint } = req.body || {};
+    if (!imageBase64 && !imageUrl) {
+      return res.status(400).json({ error: "imageBase64 or imageUrl is required" });
     }
-  }]
-};
 
-const v = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${key}`, {
-  method: "POST",
-  headers: { "content-type": "application/json" },
-  body: JSON.stringify(visionReq)
-}).then(r => r.json());
+    // If only URL is provided, fetch and convert to base64
+    let imgB64 = imageBase64 || null;
+    if (!imgB64 && imageUrl) {
+      const r = await fetch(imageUrl);
+      if (!r.ok) return res.status(400).json({ error: "failed_to_fetch_image_url" });
+      const buf = Buffer.from(await r.arrayBuffer());
+      imgB64 = buf.toString("base64");
+    }
 
-const ann = v?.responses?.[0] || {};
-const out = { candidates: [] };
+    // 1) Ask Gemini to identify the place from the photo
+    // Model: gemini-1.5-flash (fast, good with images)
+    const model = "gemini-1.5-flash";
 
-// 2) Fast path: use Landmark if confident
-if (ann.landmarkAnnotations?.length) {
-  const top = ann.landmarkAnnotations[0];
-  if (top.score >= 0.60 && top.locations?.[0]?.latLng) {
-    out.candidates.push({
-      placeName: top.description,
-      lat: top.locations[0].latLng.latitude,
-      lng: top.locations[0].latLng.longitude,
-      confidence: top.score,
-      source: "vision_landmark"
-    });
+    const hint = regionHint ? `Region hint: ${regionHint}.` : "";
+    const prompt = `
+You are a location recognition assistant. 
+Given a single photo, identify the MOST LIKELY real-world location.
+Return STRICT JSON only with fields:
+{
+  "placeName": string | null,
+  "city": string | null,
+  "state": string | null,
+  "country": string | null,
+  "confidence": number,        // 0..1
+  "rationale": string          // short reason referencing visual clues
+}
+If unsure, set placeName to null and confidence to 0. 
+${hint}
+JSON only. No prose.`;
+
+    const geminiReq = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: prompt },
+            {
+              inlineData: {
+                mimeType: "image/jpeg", // fine for png too; Gemini is tolerant
+                data: imgB64
+              }
+            }
+          ]
+        }
+      ]
+    };
+
+    const gResp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(geminiReq)
+      }
+    ).then(r => r.json());
+
+    // Pull JSON string from Gemini response (handles plain or fenced JSON)
+    const gText =
+      gResp?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    const jsonMatch = gText.match(/\{[\s\S]*\}$/) || gText.match(/\{[\s\S]*\}/);
+    let gObj = null;
+    try {
+      gObj = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(gText);
+    } catch {
+      gObj = null;
+    }
+
+    const out = { candidates: [] };
+
+    // 2) If Gemini is confident enough, push as candidate directly
+    if (gObj && (gObj.placeName || gObj.city) && (gObj.confidence ?? 0) >= 0.55) {
+      out.candidates.push({
+        placeName: gObj.placeName || [gObj.city, gObj.state, gObj.country].filter(Boolean).join(", "),
+        lat: null,
+        lng: null,
+        confidence: Math.min(0.99, Math.max(0.55, gObj.confidence ?? 0.6)),
+        source: "gemini"
+      });
+    }
+
+    // 3) Places fallback/validation using Gemini hints
+    const pieces = [
+      gObj?.placeName,
+      gObj?.city,
+      gObj?.state,
+      gObj?.country
+    ].filter(Boolean);
+
+    let textQuery = pieces.join(" ");
+    if (!textQuery && regionHint) textQuery = regionHint;
+
+    if (textQuery) {
+      const q = regionHint ? `${textQuery} ${regionHint}` : textQuery;
+      const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(
+        q
+      )}&type=tourist_attraction&key=${placesKey}`;
+
+      const pr = await fetch(url).then(r => r.json());
+      (pr.results || []).slice(0, 3).forEach((p, i) => {
+        out.candidates.push({
+          placeName: p.name,
+          lat: p.geometry?.location?.lat ?? null,
+          lng: p.geometry?.location?.lng ?? null,
+          confidence:
+            (p.user_ratings_total
+              ? Math.min(0.98, 0.62 + Math.log10(p.user_ratings_total) / 10)
+              : 0.6) - i * 0.05,
+          address: p.formatted_address,
+          placeId: p.place_id,
+          source: out.candidates.length ? "gemini+places" : "places_only"
+        });
+      });
+    }
+
+    // 4) Final selection + shape for client
+    if (!out.candidates.length) {
+      return res
+        .status(200)
+        .json({ placeName: null, lat: null, lng: null, confidence: 0, message: "no_idea" });
+    }
+
+    // Prefer a candidate with lat/lng; otherwise take the first
+    const withGeo = out.candidates.find(c => c.lat != null && c.lng != null);
+    const best = withGeo || out.candidates[0];
+
+    return res.status(200).json(best);
+  } catch (err) {
+    console.error("locationHandler error", err);
+    return res.status(500).json({ error: "server_error" });
   }
 }
-
-// 3) Web detection fallback: best guess / entities → query Places
-const web = ann.webDetection || {};
-const guess = web.bestGuessLabels?.[0]?.label || null;
-const entity = (web.webEntities || []).sort((a,b)=> (b.score||0)-(a.score||0))[0];
-const textQuery = [guess, entity?.description, "landmark", "viewpoint", "lookout"]
-  .filter(Boolean)
-  .join(" ");
-
-if (!out.candidates.length && textQuery) {
-  const q = regionHint ? `${textQuery} ${regionHint}` : textQuery;
-  const placesUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(q)}&type=tourist_attraction&key=${placesKey}`;
-  const pr = await fetch(placesUrl).then(r => r.json());
-
-  (pr.results || []).slice(0, 3).forEach((p, i) => {
-    out.candidates.push({
-      placeName: p.name,
-      lat: p.geometry?.location?.lat ?? null,
-      lng: p.geometry?.location?.lng ?? null,
-      confidence: (p.user_ratings_total ? Math.min(0.99, 0.6 + Math.log10(p.user_ratings_total)/10) : 0.6) - i*0.05,
-      address: p.formatted_address,
-      placeId: p.place_id,
-      source: "vision_web+places"
-    });
-  });
-}
-
-// 4) Final selection + shape for client
-if (!out.candidates.length) {
-  return res.status(200).json({ placeName: null, lat: null, lng: null, confidence: 0, message: "no_idea" });
-}
-
-const best = out.candidates[0];
-return res.status(200).json(best);
