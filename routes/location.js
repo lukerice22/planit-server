@@ -29,21 +29,15 @@ router.post("/", async (req, res) => {
     if (!geminiKey) {
       return res.status(500).json({ error: "missing_gemini_key" });
     }
-    if (!placesKey) {
-      // not fatal, but warn and we’ll just return Gemini’s guess
-      console.warn("[location] GOOGLE_PLACES_API_KEY missing — skipping geo resolve");
-    }
 
     const { imageBase64, imageUrl, regionHint } = req.body || {};
     if (!imageBase64 && !imageUrl) {
-      return res
-        .status(400)
-        .json({ error: "imageBase64 or imageUrl is required" });
+      return res.status(400).json({ error: "imageBase64 or imageUrl is required" });
     }
 
     // ---------- Normalize Image → base64 + mime ----------
     let imgB64 = imageBase64 || null;
-    let mime = "image/jpeg"; // client now always sends JPEG; keep as default
+    let mime = "image/jpeg"; // client now sends JPEG base64; default to jpeg
 
     if (imgB64 && imgB64.startsWith("data:")) {
       const m = imgB64.match(/^data:(.+?);base64,(.*)$/s);
@@ -51,15 +45,13 @@ router.post("/", async (req, res) => {
         mime = (m[1] || "image/jpeg").split(";")[0];
         imgB64 = m[2];
       } else {
-        // generic strip if data URL not matched perfectly
         const comma = imgB64.indexOf(",");
         if (comma >= 0) imgB64 = imgB64.slice(comma + 1);
       }
     }
 
-    // If only URL provided, fetch and convert to base64; try to honor content-type
+    // If only URL provided, fetch → base64 (best-effort content-type)
     if (!imgB64 && imageUrl) {
-      // HEAD for content-type (best effort)
       try {
         const head = await fetch(imageUrl, { method: "HEAD" });
         const ct = head.headers.get("content-type");
@@ -71,7 +63,7 @@ router.post("/", async (req, res) => {
       imgB64 = buf.toString("base64");
     }
 
-    // Reject formats Gemini can stumble on if they sneak in
+    // Guard on tricky formats if a URL sneaks in
     if (/image\/(heic|heif|avif)/i.test(mime)) {
       return res
         .status(415)
@@ -81,19 +73,23 @@ router.post("/", async (req, res) => {
     // ---------- Gemini Call ----------
     const prompt = `
 You are a location recognition assistant.
-Identify the MOST LIKELY real-world location shown in this single photo.
-Return STRICT JSON only:
+Identify the MOST LIKELY real-world location in this SINGLE photo.
+
+Return STRICT JSON only (no prose), using this exact schema:
 {
-  "placeName": string | null,
-  "city": string | null,
-  "state": string | null,
-  "country": string | null,
-  "confidence": number,       // 0.0–1.0
-  "rationale": string
+  "placeName": string | null,   // e.g. "Santa Monica Pier"
+  "city": string | null,        // e.g. "Santa Monica"
+  "state": string | null,       // e.g. "California"
+  "country": string | null,     // e.g. "United States"
+  "bestGuess": string | null,   // free-text guess if unsure (e.g., "a pier with ferris wheel on a beach")
+  "confidence": number,         // 0.0–1.0
+  "rationale": string           // short reason (<= 200 chars)
 }
-If unsure, use null fields and confidence 0.
+
+If unsure, set placeName/city/state/country to null, confidence 0, and still provide a short bestGuess.
 ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
 
+    const generationConfig = { temperature: 0.2 }; // keep it factual
     const gReq = {
       contents: [
         {
@@ -104,6 +100,7 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
           ],
         },
       ],
+      generationConfig,
     };
 
     const gUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${geminiKey}`;
@@ -114,34 +111,37 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
     }).then((r) => r.json());
 
     const finish = gResp?.candidates?.[0]?.finishReason;
-    if (finish && finish !== "STOP") {
-      console.warn("[location] Gemini finishReason:", finish);
-    }
-
     const gText = gResp?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+    // Debug (non-sensitive, short)
+    console.log("[location] finishReason:", finish);
+    if (gText) console.log("[location] gText sample:", gText.slice(0, 200));
+
     let g = null;
     try {
-      // Allow for markdown fencing; extract the first JSON object
       const jsonMatch = gText.match(/\{[\s\S]*?\}/);
       g = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(gText);
     } catch {
-      // leave g as null
+      // leave null
     }
 
     const out = { candidates: [] };
 
-    if (g && (g.placeName || g.city || g.country)) {
+    // prefer structured fields, but allow bestGuess to drive Places
+    let bestGuess = g?.bestGuess || null;
+
+    if (g && (g.placeName || g.city || g.country || bestGuess)) {
       out.candidates.push({
         placeName:
           g.placeName || [g.city, g.state, g.country].filter(Boolean).join(", "),
         lat: null,
         lng: null,
-        confidence: Math.min(0.99, Math.max(0.55, g.confidence ?? 0.6)),
+        confidence: Math.min(0.99, Math.max(0.5, g.confidence ?? 0.6)),
         source: "gemini",
       });
     }
 
-    // ---------- Resolve to lat/lng via Places (if we have a text to search) ----------
+    // ---------- Resolve to lat/lng via Places ----------
     let textQuery = "";
     const pieces = [
       g?.placeName,
@@ -149,18 +149,22 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
       g?.state,
       g?.country,
       regionHint,
+      bestGuess,
+      // sprinkle in landmark-y terms to bias search meaningfully
+      "landmark",
+      "viewpoint",
+      "tourist attraction",
     ].filter(Boolean);
+
     textQuery = pieces.join(" ").trim();
 
     if (placesKey && textQuery) {
-      // try a couple of types to improve hit rate
       const types = ["point_of_interest", "tourist_attraction", "establishment"];
       let usedResults = false;
 
       for (const t of types) {
-        const q = textQuery;
         const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(
-          q
+          textQuery
         )}&type=${t}&key=${placesKey}`;
         const pr = await fetch(url).then((r) => r.json());
 
@@ -180,15 +184,15 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
             });
           });
           usedResults = true;
-          break; // good enough
+          break; // first good hit is fine
         }
       }
+
       if (!usedResults) {
         console.warn("[location] Places found no results for:", textQuery);
       }
     }
 
-    // ---------- Final selection ----------
     if (!out.candidates.length) {
       return res
         .status(200)
