@@ -1,11 +1,10 @@
-// api/location.js
-export default async function handler(req, res) {
-  res.setHeader("X-Handler", "gemini-serverless");
+// routes/location.js
+const express = require("express");
+const router = express.Router();
 
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "POST");
-    return res.status(405).send("Method Not Allowed");
-  }
+// POST /location   (also available at /api/location via your dual mounts)
+router.post("/", async (req, res) => {
+  res.setHeader("X-Handler", "gemini-express");
 
   try {
     const geminiKey =
@@ -27,7 +26,7 @@ export default async function handler(req, res) {
       imgB64 = comma >= 0 ? imgB64.slice(comma + 1) : imgB64;
     }
 
-    // If only URL provided, fetch and convert to base64
+    // If only URL provided, fetch → base64
     if (!imgB64 && imageUrl) {
       const r = await fetch(imageUrl);
       if (!r.ok) return res.status(400).json({ error: "failed_to_fetch_image_url" });
@@ -35,7 +34,7 @@ export default async function handler(req, res) {
       imgB64 = buf.toString("base64");
     }
 
-    // ---- Gemini call (1.5-flash)
+    // --- Gemini (1.5-flash)
     const model = "gemini-1.5-flash";
     const prompt = `
 You are a location recognition assistant.
@@ -86,7 +85,7 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
       });
     }
 
-    // ---- Places fallback to get lat/lng
+    // --- Places resolve for lat/lng
     const pieces = [g?.placeName, g?.city, g?.state, g?.country].filter(Boolean);
     let textQuery = pieces.join(" ");
     if (!textQuery && regionHint) textQuery = regionHint;
@@ -116,7 +115,9 @@ ${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
     const best = withGeo || out.candidates[0];
     return res.status(200).json(best);
   } catch (e) {
-    console.error("[api/location] error", e);
+    console.error("[routes/location] error", e);
     return res.status(500).json({ error: "server_error" });
   }
-}
+});
+
+module.exports = router;
