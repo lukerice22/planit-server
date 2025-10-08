@@ -1,11 +1,11 @@
-// POST /api/location  (Gemini + Places)
-import fetch from "node-fetch";
+// routes/location.js  (CommonJS + Express Router)
+const express = require("express");
+const router = express.Router();
 
-export default async function locationHandler(req, res) {
+router.post("/", async (req, res) => {
   try {
     const geminiKey =
-      process.env.GOOGLE_GEMINI_API_KEY ||
-      process.env.GOOGLE_SERVER_API_KEY;
+      process.env.GOOGLE_GEMINI_API_KEY || process.env.GOOGLE_SERVER_API_KEY;
     const placesKey =
       process.env.GOOGLE_PLACES_API_KEY ||
       process.env.GOOGLE_SERVER_API_KEY ||
@@ -16,8 +16,14 @@ export default async function locationHandler(req, res) {
       return res.status(400).json({ error: "imageBase64 or imageUrl is required" });
     }
 
-    // If only URL is provided, fetch and convert to base64
+    // Accept both "pure" base64 and data URLs like "data:image/jpeg;base64,..."
     let imgB64 = imageBase64 || null;
+    if (imgB64 && imgB64.startsWith("data:")) {
+      const comma = imgB64.indexOf(",");
+      imgB64 = comma >= 0 ? imgB64.slice(comma + 1) : imgB64;
+    }
+
+    // If only URL provided, fetch → base64
     if (!imgB64 && imageUrl) {
       const r = await fetch(imageUrl);
       if (!r.ok) return res.status(400).json({ error: "failed_to_fetch_image_url" });
@@ -25,39 +31,30 @@ export default async function locationHandler(req, res) {
       imgB64 = buf.toString("base64");
     }
 
-    // 1) Ask Gemini to identify the place from the photo
-    // Model: gemini-1.5-flash (fast, good with images)
+    // --- Gemini call (1.5-flash)
     const model = "gemini-1.5-flash";
-
-    const hint = regionHint ? `Region hint: ${regionHint}.` : "";
     const prompt = `
-You are a location recognition assistant. 
-Given a single photo, identify the MOST LIKELY real-world location.
-Return STRICT JSON only with fields:
+You are a location recognition assistant.
+Identify the MOST LIKELY real-world location in this single photo.
+Return STRICT JSON only:
 {
   "placeName": string | null,
   "city": string | null,
   "state": string | null,
   "country": string | null,
-  "confidence": number,        // 0..1
-  "rationale": string          // short reason referencing visual clues
+  "confidence": number,
+  "rationale": string
 }
-If unsure, set placeName to null and confidence to 0. 
-${hint}
-JSON only. No prose.`;
+If unsure, use null and confidence 0.
+${regionHint ? `Region hint: ${regionHint}.` : ""}`.trim();
 
-    const geminiReq = {
+    const gReq = {
       contents: [
         {
           role: "user",
           parts: [
             { text: prompt },
-            {
-              inlineData: {
-                mimeType: "image/jpeg", // fine for png too; Gemini is tolerant
-                data: imgB64
-              }
-            }
+            { inlineData: { mimeType: "image/jpeg", data: imgB64 } }
           ]
         }
       ]
@@ -65,64 +62,41 @@ JSON only. No prose.`;
 
     const gResp = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(geminiReq)
-      }
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(gReq) }
     ).then(r => r.json());
 
-    // Pull JSON string from Gemini response (handles plain or fenced JSON)
-    const gText =
-      gResp?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    const gText = gResp?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     const jsonMatch = gText.match(/\{[\s\S]*\}$/) || gText.match(/\{[\s\S]*\}/);
-    let gObj = null;
-    try {
-      gObj = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(gText);
-    } catch {
-      gObj = null;
-    }
+    let g = null;
+    try { g = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(gText); } catch {}
 
     const out = { candidates: [] };
 
-    // 2) If Gemini is confident enough, push as candidate directly
-    if (gObj && (gObj.placeName || gObj.city) && (gObj.confidence ?? 0) >= 0.55) {
+    if (g && (g.placeName || g.city)) {
       out.candidates.push({
-        placeName: gObj.placeName || [gObj.city, gObj.state, gObj.country].filter(Boolean).join(", "),
+        placeName: g.placeName || [g.city, g.state, g.country].filter(Boolean).join(", "),
         lat: null,
         lng: null,
-        confidence: Math.min(0.99, Math.max(0.55, gObj.confidence ?? 0.6)),
+        confidence: Math.min(0.99, Math.max(0.55, g.confidence ?? 0.6)),
         source: "gemini"
       });
     }
 
-    // 3) Places fallback/validation using Gemini hints
-    const pieces = [
-      gObj?.placeName,
-      gObj?.city,
-      gObj?.state,
-      gObj?.country
-    ].filter(Boolean);
-
+    // --- Resolve via Places Text Search (to get lat/lng)
+    const pieces = [g?.placeName, g?.city, g?.state, g?.country].filter(Boolean);
     let textQuery = pieces.join(" ");
     if (!textQuery && regionHint) textQuery = regionHint;
 
     if (textQuery) {
       const q = regionHint ? `${textQuery} ${regionHint}` : textQuery;
-      const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(
-        q
-      )}&type=tourist_attraction&key=${placesKey}`;
-
+      const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(q)}&type=tourist_attraction&key=${placesKey}`;
       const pr = await fetch(url).then(r => r.json());
       (pr.results || []).slice(0, 3).forEach((p, i) => {
         out.candidates.push({
           placeName: p.name,
           lat: p.geometry?.location?.lat ?? null,
           lng: p.geometry?.location?.lng ?? null,
-          confidence:
-            (p.user_ratings_total
-              ? Math.min(0.98, 0.62 + Math.log10(p.user_ratings_total) / 10)
-              : 0.6) - i * 0.05,
+          confidence: (p.user_ratings_total ? Math.min(0.98, 0.62 + Math.log10(p.user_ratings_total)/10) : 0.6) - i*0.05,
           address: p.formatted_address,
           placeId: p.place_id,
           source: out.candidates.length ? "gemini+places" : "places_only"
@@ -130,20 +104,19 @@ JSON only. No prose.`;
       });
     }
 
-    // 4) Final selection + shape for client
     if (!out.candidates.length) {
-      return res
-        .status(200)
-        .json({ placeName: null, lat: null, lng: null, confidence: 0, message: "no_idea" });
+      return res.status(200).json({ placeName: null, lat: null, lng: null, confidence: 0, message: "no_idea" });
     }
 
-    // Prefer a candidate with lat/lng; otherwise take the first
     const withGeo = out.candidates.find(c => c.lat != null && c.lng != null);
     const best = withGeo || out.candidates[0];
 
+    // Final shape matches your client expectations
     return res.status(200).json(best);
-  } catch (err) {
-    console.error("locationHandler error", err);
+  } catch (e) {
+    console.error("[/api/location] error", e);
     return res.status(500).json({ error: "server_error" });
   }
-}
+});
+
+module.exports = router;
