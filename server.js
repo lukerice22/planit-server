@@ -48,20 +48,30 @@ try {
 const db = admin.apps.length ? admin.firestore() : null;
 
 const app = express();
-app.get('/health', (req, res) => res.json({ ok: true }));
 const PORT = process.env.PORT || 5000;
 
 // ✅ increase body size limits for base64 images
 app.use(cors());
-app.use(express.json({ limit: '6mb' }));
-app.use(express.urlencoded({ extended: true, limit: '6mb' }));
+app.use(express.json({ limit: "6mb" }));
+app.use(express.urlencoded({ extended: true, limit: "6mb" }));
 
-// ---- Routes
-app.get('/', (req, res) => {
-  res.send('PlanIt backend is running!');
+// ---- Health + root
+app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/", (req, res) => {
+  res.send("PlanIt backend is running!");
 });
 
-app.get("/api/firebase-config", (req, res) => {
+// ------------------------------------------------------------
+// Helper: map the SAME handler at both /api/<path> and /<path>
+// (Vercel's api/index.js strips the /api prefix before Express)
+function mapBoth(method, route, handler) {
+  app[method](`/api${route}`, handler);
+  app[method](route, handler);
+}
+// ------------------------------------------------------------
+
+// ---- Simple key/config endpoints (both prefixed and unprefixed)
+mapBoth("get", "/firebase-config", (req, res) => {
   res.json({
     apiKey: process.env.FIREBASE_API_KEY,
     authDomain: process.env.FIREBASE_AUTH_DOMAIN,
@@ -72,13 +82,13 @@ app.get("/api/firebase-config", (req, res) => {
   });
 });
 
-app.get("/api/maptiler-key", (req, res) => {
+mapBoth("get", "/maptiler-key", (req, res) => {
   const key = process.env.MAPTILER_API_KEY;
   if (!key) return res.status(500).json({ error: "MapTiler key missing" });
   res.status(200).json({ key });
 });
 
-app.get("/api/check-username", async (req, res) => {
+mapBoth("get", "/check-username", async (req, res) => {
   const { username } = req.query;
   if (!username) return res.status(400).json({ error: "Username is required" });
   if (!db) return res.status(500).json({ error: "Firestore not initialized" });
@@ -90,42 +100,49 @@ app.get("/api/check-username", async (req, res) => {
       .get();
     res.status(200).json({ available: snapshot.empty });
   } catch (error) {
-    console.error("[ERROR] /api/check-username", error);
+    console.error("[ERROR] /check-username", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Autocomplete route
+// ---- Routes that are Express Routers
 try {
   const autocompleteRoute = require("./routes/autocomplete");
+  // /api/autocomplete and /autocomplete
   app.use("/api/autocomplete", autocompleteRoute);
-  console.log("[BOOT] Mounted /api/autocomplete");
+  app.use("/autocomplete", autocompleteRoute);
+  console.log("[BOOT] Mounted /api/autocomplete & /autocomplete");
 } catch (e) {
-  console.warn("[WARN] Could not mount /api/autocomplete:", e.message);
+  console.warn("[WARN] Could not mount /autocomplete:", e.message);
 }
 
 try {
   const locationRoute = require("./routes/location");
+  // /api/location and /location
   app.use("/api/location", locationRoute);
-  console.log("[BOOT] Mounted /api/location");
+  app.use("/location", locationRoute);
+  console.log("[BOOT] Mounted /api/location & /location");
 } catch (e) {
-  console.warn("[WARN] Could not mount /api/location:", e.message);
+  console.warn("[WARN] Could not mount /location:", e.message);
 }
 
 try {
   const tripRoute = require("./routes/trip");
+  // /api/trip and /trip
   app.use("/api/trip", tripRoute);
-  console.log("[BOOT] Mounted /api/trip");
+  app.use("/trip", tripRoute);
+  console.log("[BOOT] Mounted /api/trip & /trip");
 } catch (e) {
-  console.warn("[WARN] Could not mount /api/trip:", e.message);
+  console.warn("[WARN] Could not mount /trip:", e.message);
 }
-// server.js - temporary sanity endpoint (remove after debugging)
-app.get("/api/_whoami", (req, res) => {
+
+// ---- Temporary sanity endpoint (remove when done)
+mapBoth("get", "/_whoami", (req, res) => {
   res.setHeader("X-App", "planit-backend-express");
   res.status(200).json({
     ok: true,
     from: "server.js",
-    mounted: ["/api/autocomplete", "/api/location", "/api/trip"]
+    mounted: ["/autocomplete", "/location", "/trip"],
   });
 });
 
