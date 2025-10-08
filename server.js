@@ -1,60 +1,66 @@
 // server.js
-require('dotenv').config();
+require("dotenv").config();
 
-const path = require('path');
-const express = require('express');
-const cors = require('cors');
-const admin = require('firebase-admin');
+const path = require("path");
+const express = require("express");
+const cors = require("cors");
+const admin = require("firebase-admin");
 
-// ---- Boot logs & global error handlers
-console.log('[BOOT] Entered server.js in', __dirname);
-process.on('unhandledRejection', (reason) => {
-  console.error('[UNHANDLED REJECTION]', reason);
+console.log("[BOOT] Entered server.js in", __dirname);
+process.on("unhandledRejection", (reason) => {
+  console.error("[UNHANDLED REJECTION]", reason);
 });
-process.on('uncaughtException', (err) => {
-  console.error('[UNCAUGHT EXCEPTION]', err);
-  process.exit(1);
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT EXCEPTION]", err);
 });
 
-// ---- Load service account safely
-const saPath = path.join(__dirname, 'serviceAccountKey.json');
-console.log('[BOOT] Using service account at:', saPath);
-
+// ---- Load service account (env for Vercel, file only for local dev)
 let serviceAccount;
 try {
-  serviceAccount = require(saPath);
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    console.log("[BOOT] Loaded service account from env");
+  } else {
+    const saPath = path.join(__dirname, "serviceAccountKey.json");
+    serviceAccount = require(saPath);
+    console.log("[BOOT] Loaded service account from file:", saPath);
+  }
 } catch (e) {
-  console.error('[ERROR] Missing or unreadable serviceAccountKey.json at:', saPath);
-  console.error('        If you moved folders, copy the key file here.');
-  process.exit(1);
+  console.warn(
+    "[WARN] No Firebase service account available. Admin will not init.",
+    e?.message || e
+  );
 }
 
 // ---- Firebase Admin
 try {
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  });
-  console.log('[BOOT] Firebase Admin initialized');
+  if (serviceAccount && !admin.apps.length) {
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    console.log("[BOOT] Firebase Admin initialized");
+  } else if (!serviceAccount) {
+    console.warn("[BOOT] Skipping Firebase Admin init (missing credentials).");
+  }
 } catch (e) {
-  console.error('[ERROR] Firebase Admin init failed:', e);
-  process.exit(1);
+  console.error("[ERROR] Firebase Admin init failed:", e);
+  // don't exit on serverless
 }
 
-const db = admin.firestore();
+const db = admin.apps.length ? admin.firestore() : null;
 
 const app = express();
-app.get('/health', (req, res) => res.json({ ok: true }));
-const PORT = process.env.PORT || 5000;
-
 app.use(cors());
 app.use(express.json());
 
+const PORT = process.env.PORT || 5000;
+
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 // ---- Routes
-app.get('/', (req, res) => {
-  res.send('PlanIt backend is running!');
+app.get("/", (req, res) => {
+  res.send("PlanIt backend is running!");
 });
 
-app.get('/api/firebase-config', (req, res) => {
+app.get("/api/firebase-config", (req, res) => {
   res.json({
     apiKey: process.env.FIREBASE_API_KEY,
     authDomain: process.env.FIREBASE_AUTH_DOMAIN,
@@ -65,38 +71,42 @@ app.get('/api/firebase-config', (req, res) => {
   });
 });
 
-app.get('/api/maptiler-key', (req, res) => {
+app.get("/api/maptiler-key", (req, res) => {
   const key = process.env.MAPTILER_API_KEY;
-  if (!key) return res.status(500).json({ error: 'MapTiler key missing' });
+  if (!key) return res.status(500).json({ error: "MapTiler key missing" });
   res.status(200).json({ key });
 });
 
-app.get('/api/check-username', async (req, res) => {
+app.get("/api/check-username", async (req, res) => {
   const { username } = req.query;
-  if (!username) return res.status(400).json({ error: 'Username is required' });
+  if (!username) return res.status(400).json({ error: "Username is required" });
+  if (!db) return res.status(500).json({ error: "Firestore not initialized" });
+
   try {
-    const snapshot = await db.collection('users').where('username', '==', String(username).toLowerCase()).get();
+    const snapshot = await db
+      .collection("users")
+      .where("username", "==", String(username).toLowerCase())
+      .get();
     res.status(200).json({ available: snapshot.empty });
   } catch (error) {
-    console.error('[ERROR] /api/check-username', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error("[ERROR] /api/check-username", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Autocomplete route (make sure this file exists and exports an Express router)
+// Autocomplete route
 try {
-  const autocompleteRoute = require('./routes/autocomplete');
-  app.use('/api/autocomplete', autocompleteRoute);
-  console.log('[BOOT] Mounted /api/autocomplete');
+  const autocompleteRoute = require("./routes/autocomplete");
+  app.use("/api/autocomplete", autocompleteRoute);
+  console.log("[BOOT] Mounted /api/autocomplete");
 } catch (e) {
-  console.warn('[WARN] Could not mount /api/autocomplete:', e.message);
+  console.warn("[WARN] Could not mount /api/autocomplete:", e.message);
 }
 
 // --- Vercel compatibility ---
 if (process.env.VERCEL) {
-  module.exports = app; // Export for Vercel serverless handler
+  module.exports = app;
 } else {
-  // Local dev only
   app.listen(PORT, () => {
     console.log(`✅ PlanIt backend listening on http://localhost:${PORT}`);
   });
