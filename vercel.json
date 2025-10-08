@@ -1,9 +1,7 @@
 {
   "functions": {
     "api/index.js": {
-      "runtime": "nodejs22.x",
-      "maxDuration": 15,
-      "memory": 1024
+      "runtime": "nodejs18.x"
     }
   },
   "routes": [
